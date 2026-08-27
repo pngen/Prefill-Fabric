@@ -28,29 +28,34 @@ rejection across a distributed control plane. The distinction between **total pr
 ```mermaid
 flowchart LR
   subgraph Backends
-    CPU[CPU Executor]
-    CUDA[CUDA Executor (Blackwell sm_120)]
+    CPU["CPU Executor"]
+    CUDA["CUDA Executor (Blackwell sm_120)"]
   end
   subgraph Core
-    S[PrefillScheduler]
-    M[MemoryGovernor]
-    P[ChunkPlanner]
-    C[Compatibility / Packing]
-    F[Fairness/Deadline]
-    X[Explain/Stats/Events]
+    S["PrefillScheduler"]
+    M["MemoryGovernor"]
+    P["ChunkPlanner"]
+    C["Compatibility / Packing"]
+    F["Fairness/Deadline"]
+    X["Explain/Stats/Events"]
   end
   subgraph Distributed
-    Coord[Coordinator]
-    W1[Worker 1]
-    W2[Worker 2]
-    Cli[Client/CLI]
+    Coord["Coordinator"]
+    W1["Worker 1"]
+    W2["Worker 2"]
+    Cli["Client/CLI"]
   end
-  S --> M; S --> P; S --> C; S --> F; S --> X;
-  Coord --> S;
-  Coord -->|framed TCP dispatch| W1;
-  Coord -->|framed TCP dispatch| W2;
-  W1 --> CPU; W2 --> CUDA;
-  Cli -->|framed TCP submit/query| Coord;
+  S --> M
+  S --> P
+  S --> C
+  S --> F
+  S --> X
+  Coord --> S
+  Coord -->|framed TCP dispatch| W1
+  Coord -->|framed TCP dispatch| W2
+  W1 --> CPU
+  W2 --> CUDA
+  Cli -->|framed TCP submit/query| Coord
 ```
 
 The runtime core (`PrefillScheduler`) is thread-safe and never performs network or blocking I/O
