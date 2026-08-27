@@ -1,0 +1,6 @@
+add_executable(concurrency_test concurrency_test.cpp)
+target_link_libraries(concurrency_test PRIVATE pf_test_common)
+if(MSVC)
+  target_compile_options(concurrency_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME concurrency COMMAND concurrency_test)

@@ -1,0 +1,20 @@
+Prefill Fabric
+
+Copyright (c) 2026 Summon Software Labs
+
+Prefill Fabric is an open-source, vendor-neutral runtime for scheduling,
+packing, executing, measuring, and governing prefill work across
+heterogeneous AI inference infrastructure.
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file in this distribution for the full license text.
+
+Prefill Fabric does not collect or transmit any telemetry. All telemetry is
+written to local files chosen by the operator and never leaves the machine
+running the software.
+
+Prefill Fabric accepts contributions from individuals and organizations on
+the terms of the Apache License 2.0 without requiring a Contributor License
+Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
+
+No telemetry transmission.

@@ -1,0 +1,6 @@
+add_executable(adversarial_test adversarial_test.cpp)
+target_link_libraries(adversarial_test PRIVATE pf_test_common)
+if(MSVC)
+  target_compile_options(adversarial_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME adversarial COMMAND adversarial_test)

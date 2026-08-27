@@ -1,0 +1,7 @@
+add_executable(atomic_closure_test atomic_closure_test.cpp)
+target_link_libraries(atomic_closure_test PRIVATE pf_test_common)
+target_compile_definitions(atomic_closure_test PRIVATE PFABRIC_EXE="$<TARGET_FILE:pfabric>")
+if(MSVC)
+  target_compile_options(atomic_closure_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME atomic_closure COMMAND atomic_closure_test)

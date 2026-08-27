@@ -1,0 +1,6 @@
+add_executable(pf_benchmark benchmark.cpp)
+target_link_libraries(pf_benchmark PRIVATE PrefillFabric)
+if(MSVC)
+  target_compile_options(pf_benchmark PRIVATE /W4 /WX)
+endif()
+set_target_properties(pf_benchmark PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

@@ -1,0 +1,6 @@
+add_library(pf_test_common STATIC TestMain.cpp)
+target_link_libraries(pf_test_common PUBLIC PrefillFabric)
+target_include_directories(pf_test_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR})
+if(MSVC)
+  target_compile_options(pf_test_common PRIVATE /W4 /WX)
+endif()

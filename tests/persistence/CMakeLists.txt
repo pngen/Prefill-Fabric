@@ -1,0 +1,6 @@
+add_executable(persistence_test persistence_test.cpp)
+target_link_libraries(persistence_test PRIVATE pf_test_common)
+if(MSVC)
+  target_compile_options(persistence_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME persistence COMMAND persistence_test)

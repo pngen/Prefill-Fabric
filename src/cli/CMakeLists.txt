@@ -1,0 +1,6 @@
+add_executable(pfabric main.cpp)
+target_link_libraries(pfabric PRIVATE PrefillFabric)
+if(MSVC)
+  target_compile_options(pfabric PRIVATE /W4 /WX)
+endif()
+set_target_properties(pfabric PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

@@ -1,0 +1,6 @@
+add_executable(property_test property_test.cpp)
+target_link_libraries(property_test PRIVATE pf_test_common)
+if(MSVC)
+  target_compile_options(property_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME property COMMAND property_test)

@@ -1,0 +1,7 @@
+add_executable(multiprocess_test multiprocess_test.cpp)
+target_link_libraries(multiprocess_test PRIVATE pf_test_common)
+target_compile_definitions(multiprocess_test PRIVATE PFABRIC_EXE="$<TARGET_FILE:pfabric>")
+if(MSVC)
+  target_compile_options(multiprocess_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME multiprocess COMMAND multiprocess_test)
