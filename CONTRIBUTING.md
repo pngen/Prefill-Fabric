@@ -11,7 +11,7 @@ without requiring a Contributor License Agreement (CLA) (see NOTICE).
    regression test and, where appropriate, a property/adversarial case.
 3. Keep the build clean: `/W4 /WX` (MSVC) with zero warnings in Release and Debug. The CUDA executor
    is compiled by `nvcc` with `/W4 /WX` host flags.
-4. Run the full suite: `ctest --test-dir build --output-on-failure`. Do not introduce test timeouts.
+4. Run the full suite: `ctest --test-dir build --output-on-failure`.
 5. Submit a pull request. Maintainers do not add Co-authored-by trailers unless you opt in.
 
 ## Code conventions
