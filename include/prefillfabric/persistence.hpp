@@ -13,7 +13,10 @@
 namespace prefillfabric {
 
 inline constexpr std::uint32_t kPersistenceMagic = 0x50524631u;  // "PRF1"
-inline constexpr std::uint32_t kPersistenceVersion = 1u;
+inline constexpr std::uint32_t kPersistenceVersion = 2u;
+// Version 1 snapshots are still read. Their request records lack the fields at
+// the end of PersistedRequestRecord, which keep their defaults.
+inline constexpr std::uint32_t kPersistenceVersionMin = 1u;
 
 // Deterministic little-endian byte writer.
 class ByteWriter {
@@ -160,6 +163,16 @@ struct PersistedRequestRecord {
   bool has_deadline = false;
   bool has_queue_delay = false;
   std::int64_t max_queue_delay_ns = 0;
+  // Since format version 2: what a recovered request needs so that its chunk
+  // plan, its memory reservations, its placement and its retry budget are the
+  // ones it was admitted with.
+  std::string backend = kBackendAny;
+  DeviceId device;
+  InputLayout input_layout = InputLayout::seq_major;
+  std::uint64_t memory_estimate_bytes = 0;
+  std::uint64_t compute_estimate = 0;
+  int max_retries = 2;
+  int retries_used = 0;
 };
 
 struct PersistedWorkerRecord {

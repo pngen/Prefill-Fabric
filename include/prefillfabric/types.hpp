@@ -303,4 +303,31 @@ inline const char* to_string(WorkerState s) noexcept {
   }
 }
 
+// Range checks for enum values that reach the runtime from outside the process
+// (a frame on the wire, a persisted snapshot) as raw integers.
+inline bool is_valid(NumericMode v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(NumericMode::mixed);
+}
+inline bool is_valid(LatencyClass v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(LatencyClass::real_time);
+}
+inline bool is_valid(InputLayout v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(InputLayout::block);
+}
+inline bool is_valid(WorkKind v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(WorkKind::stale_rejected);
+}
+inline bool is_valid(AdapterRelation v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(AdapterRelation::distinct);
+}
+inline bool is_valid(Lifecycle v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(Lifecycle::rejected);
+}
+inline bool is_valid(MemberOutcome v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(MemberOutcome::stale_rejected);
+}
+inline bool is_valid(WorkerState v) noexcept {
+  return static_cast<int>(v) >= 0 && static_cast<int>(v) <= static_cast<int>(WorkerState::retired);
+}
+
 }  // namespace prefillfabric

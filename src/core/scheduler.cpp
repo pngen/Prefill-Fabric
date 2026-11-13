@@ -12,8 +12,11 @@
 #include <limits>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 
 namespace prefillfabric {
+
+bool is_terminal_lifecycle(Lifecycle l) noexcept;
 
 struct PrefillScheduler::Impl {
   SchedulerConfig cfg;
@@ -33,6 +36,9 @@ struct PrefillScheduler::Impl {
   std::uint64_t next_reservation_value = 1;
   std::uint64_t next_boot_value = 1;
   WorkerId next_worker_value{1};
+  // Admitted requests that have not reached a terminal state. The admission
+  // bound applies to these, not to every request the scheduler remembers.
+  std::uint64_t live_requests = 0;
 
   struct Rs {
     PrefillRequest request;
@@ -48,6 +54,7 @@ struct PrefillScheduler::Impl {
     bool in_flight = false;
     GroupId current_group;
     WorkerId dispatched_worker;
+    DeviceId dispatched_device;
     Nanoseconds dispatch_time = 0;
     WorkKind last_work_kind = WorkKind::full_prompt;
     int retries_used = 0;
@@ -58,12 +65,15 @@ struct PrefillScheduler::Impl {
     std::uint64_t chunks_done = 0;
     bool cancel_pending = false;
     bool recovered_work = false;
+    bool ever_dispatched = false;
     std::vector<std::string> trace;
   };
 
   struct Gs {
     ExecutionGroup group;
     WorkerId worker;
+    DeviceId device;
+    Nanoseconds dispatch_time = 0;
     std::set<RequestId, std::less<RequestId>> outstanding;
   };
 
@@ -80,7 +90,9 @@ struct PrefillScheduler::Impl {
 
   explicit Impl(SchedulerConfig c, std::shared_ptr<Clock> cl)
       : cfg(c), clock(std::move(cl)), planner(std::make_unique<ChunkPlanner>(c)),
-        mem(c.usable_memory_bytes(), c.memory_headroom_bytes) {
+        // The governor gets the device memory and the effective headroom, so
+        // its budget is usable_memory_bytes() and the headroom is taken once.
+        mem(c.device_memory_bytes, c.device_memory_bytes - c.usable_memory_bytes()) {
     WorkerDescriptor w;
     w.worker_id = WorkerId(0);
     w.boot_id = WorkerBootId(next_boot_value++);
@@ -125,6 +137,93 @@ struct PrefillScheduler::Impl {
     }
   }
 
+  // A request's explain trace keeps its most recent entries only: a request
+  // deferred cycle after cycle would otherwise grow it without bound.
+  static constexpr std::size_t kMaxTraceEntries = 256;
+
+  void note(Rs& s, std::string line) {
+    s.trace.push_back(std::move(line));
+    if (s.trace.size() > 2 * kMaxTraceEntries) {
+      s.trace.erase(s.trace.begin(),
+                    s.trace.begin() + static_cast<std::ptrdiff_t>(s.trace.size() - kMaxTraceEntries));
+    }
+  }
+
+  // Bookkeeping shared by every path that ends a request: the tenant gets its
+  // outstanding slot and admitted tokens back, and the request stops counting
+  // against the admission bound.
+  void close_request(Rs& s) {
+    auto it = tenants_.find(s.request.tenant_id);
+    if (it != tenants_.end()) {
+      TenantService& ts = it->second;
+      if (ts.outstanding > 0) ts.outstanding--;
+      const std::uint64_t rem = s.request.remaining_prefill_tokens();
+      ts.admitted_tokens = ts.admitted_tokens >= rem ? ts.admitted_tokens - rem : 0;
+    }
+    if (live_requests > 0) --live_requests;
+  }
+
+  // Take a request out of the group it was dispatched in. The worker's unit is
+  // released only when the last member has left the group.
+  void leave_group(Rs& s) {
+    if (s.current_group.is_nil()) return;
+    auto git = groups_.find(s.current_group);
+    if (git != groups_.end()) {
+      git->second.outstanding.erase(s.request.request_id);
+      if (git->second.outstanding.empty()) {
+        auto wit = workers_.find(git->second.worker);
+        if (wit != workers_.end() && wit->second.busy_units > 0) wit->second.busy_units--;
+        stats.per_device[git->second.device].busy_total_ns += (now() - git->second.dispatch_time);
+        groups_.erase(git);
+      }
+    }
+    s.current_group = GroupId();
+  }
+
+  // End a request that has no work in flight as cancelled.
+  void finish_cancelled(Rs& s, const char* trace_line, const char* event_detail) {
+    s.lifecycle = Lifecycle::cancelled;
+    s.cancel_pending = false;
+    stats.cancelled++;
+    close_request(s);
+    note(s, trace_line);
+    events.record(now(), "cancel", s.request.request_id, s.attempt, event_detail);
+  }
+
+  // Put the chunk a request had in flight back in the queue. The same attempt
+  // redoes it under a generation assigned at the next dispatch, so a late
+  // completion of the abandoned dispatch is stale. A request whose
+  // cancellation was pending has nothing in flight any more and ends here.
+  void requeue_in_flight(Rs& s, const char* trace_line) {
+    s.in_flight = false;
+    release_reservation(s);
+    s.current_generation = Generation(0);
+    if (s.cancel_pending) {
+      finish_cancelled(s, "cancelled; in-flight work abandoned", "abandoned");
+      return;
+    }
+    s.recovered_work = true;
+    s.lifecycle = Lifecycle::queued;
+    note(s, trace_line);
+  }
+
+  // Recover everything dispatched to a worker that is lost or was restarted.
+  void recover_worker_groups(WorkerId w, const char* trace_line) {
+    for (auto git = groups_.begin(); git != groups_.end();) {
+      if (git->second.worker != w) { ++git; continue; }
+      for (const RequestId rid : git->second.outstanding) {
+        auto it = requests_.find(rid);
+        if (it == requests_.end()) continue;
+        Rs& s = it->second;
+        if (!s.in_flight || s.lifecycle != Lifecycle::dispatched) continue;
+        s.current_group = GroupId();
+        requeue_in_flight(s, trace_line);
+        events.record(now(), "worker-lost", rid, s.attempt, "recovered");
+      }
+      git = groups_.erase(git);
+    }
+  }
+
   std::uint64_t queued_count_locked() const noexcept {
     std::uint64_t n = 0;
     for (const auto& kv : requests_) {
@@ -153,6 +252,40 @@ struct PrefillScheduler::Impl {
     }
     return n;
   }
+
+  // Requests with a chunk dispatched and not yet reported.
+  std::uint64_t in_flight_locked() const noexcept {
+    std::uint64_t n = 0;
+    for (const auto& kv : groups_) n += kv.second.outstanding.size();
+    return n;
+  }
+
+  // The cumulative counters together with the point-in-time values, which are
+  // computed here so they are current whenever statistics are read.
+  Stats stats_locked() const {
+    Stats st = stats;
+    st.queue_depth = 0;
+    st.waiting_tokens = 0;
+    st.running_requests = 0;
+    st.remaining_prefill_tokens = 0;
+    for (const auto& kv : requests_) {
+      const Rs& s = kv.second;
+      if (s.in_flight) st.running_requests++;
+      if (s.lifecycle == Lifecycle::queued && !s.in_flight) {
+        st.queue_depth++;
+        st.waiting_tokens += pending_token_count(s);
+      }
+      if (!is_terminal_lifecycle(s.lifecycle)) {
+        const std::uint64_t rem = s.request.remaining_prefill_tokens();
+        st.remaining_prefill_tokens += rem > s.completed_uncached ? rem - s.completed_uncached : 0;
+      }
+    }
+    st.reserved_memory_bytes = mem.reserved_bytes();
+    st.available_memory_bytes = mem.available_bytes();
+    st.mem_underflow_flag = mem.underflow_happened() ? 1 : 0;
+    st.per_tenant = tenants_;
+    return st;
+  }
 };
 
 PrefillScheduler::PrefillScheduler(SchedulerConfig cfg, std::shared_ptr<Clock> clock)
@@ -164,9 +297,9 @@ const SchedulerConfig& PrefillScheduler::config() const noexcept { return impl_-
 MemoryGovernor& PrefillScheduler::memory() { return impl_->mem; }
 EventLog& PrefillScheduler::events() { return impl_->events; }
 const EventLog& PrefillScheduler::events() const { return impl_->events; }
-Epoch PrefillScheduler::current_epoch() const { return impl_->epoch; }
-std::uint64_t PrefillScheduler::next_generation_value() const { return impl_->next_generation_value; }
-std::uint64_t PrefillScheduler::next_attempt_value() const { return impl_->next_attempt_value; }
+Epoch PrefillScheduler::current_epoch() const { auto lk = impl_->lock(); return impl_->epoch; }
+std::uint64_t PrefillScheduler::next_generation_value() const { auto lk = impl_->lock(); return impl_->next_generation_value; }
+std::uint64_t PrefillScheduler::next_attempt_value() const { auto lk = impl_->lock(); return impl_->next_attempt_value; }
 void PrefillScheduler::set_ring_note(bool) noexcept {}
 namespace {
 
@@ -198,35 +331,58 @@ Result<void> PrefillScheduler::submit_with_tokens(const PrefillRequest& req,
 
   if (impl_->requests_.find(req.request_id) != impl_->requests_.end())
     return Result<void>::err(ErrorCode::duplicate_request, "duplicate request id");
+  if (tokens.size() != req.prompt_token_count)
+    return Result<void>::err(ErrorCode::invalid_argument, "token buffer length != prompt_token_count");
+
+  // Nothing is kept for a request that is turned away: its token payload, a
+  // tenant entry and an attempt id are only taken once it is admitted.
+  auto reject = [&](ErrorCode code, const char* message) {
+    impl_->stats.rejected++;
+    impl_->stats.rejection_by_reason[code]++;
+    return Result<void>::err(code, message);
+  };
+
+  // The admission bound applies to requests that are still outstanding, not
+  // to every request the scheduler remembers.
+  if (impl_->live_requests >= impl_->cfg.max_admitted_requests)
+    return reject(ErrorCode::capacity_exceeded, "admission capacity exceeded");
+  const std::uint64_t running = impl_->in_flight_locked();
+  const std::uint64_t waiting = impl_->live_requests > running ? impl_->live_requests - running : 0;
+  if (waiting >= impl_->cfg.max_queued_requests)
+    return reject(ErrorCode::backpressure, "queue is full");
+
+  const std::uint64_t rem = req.remaining_prefill_tokens();
+  const auto tit = impl_->tenants_.find(req.tenant_id);
+  const bool known_tenant = tit != impl_->tenants_.end();
+  const std::uint64_t tenant_outstanding = known_tenant ? tit->second.outstanding : 0;
+  const std::uint64_t tenant_tokens = known_tenant ? tit->second.admitted_tokens : 0;
+  if (tenant_outstanding >= impl_->cfg.per_tenant_outstanding_limit)
+    return reject(ErrorCode::capacity_exceeded, "tenant outstanding limit exceeded");
+  const std::uint64_t token_limit = impl_->cfg.per_tenant_admitted_token_limit;
+  if (rem > token_limit || tenant_tokens > token_limit - rem)
+    return reject(ErrorCode::capacity_exceeded, "tenant admitted-token limit exceeded");
+
+  // A chunk larger than the whole memory budget could never be reserved, so
+  // the request would wait in the queue forever.
+  PrefillPlan plan = impl_->planner->plan(req, AttemptId(impl_->next_attempt_value), Generation(0));
+  const std::uint64_t budget = impl_->mem.budget();
+  for (const auto& c : plan.chunks) {
+    if (c.memory_estimate_bytes > budget)
+      return reject(ErrorCode::memory_unavailable, "a chunk of the request exceeds the memory budget");
+  }
 
   auto tr = impl_->token_resolver->register_request(req, std::move(tokens));
   if (!tr) return Result<void>::err(tr.error());
 
-  if (impl_->requests_.size() >= impl_->cfg.max_admitted_requests) {
-    impl_->stats.rejected++;
-    impl_->stats.rejection_by_reason[ErrorCode::capacity_exceeded]++;
-    return Result<void>::err(ErrorCode::capacity_exceeded, "admission capacity exceeded");
-  }
   auto& ts = impl_->tenants_[req.tenant_id];
-  if (ts.weight == 0.0) ts.weight = req.tenant_weight;
-  if (ts.outstanding >= impl_->cfg.per_tenant_outstanding_limit) {
-    impl_->stats.rejected++;
-    impl_->stats.rejection_by_reason[ErrorCode::capacity_exceeded]++;
-    return Result<void>::err(ErrorCode::capacity_exceeded, "tenant outstanding limit exceeded");
-  }
-  const std::uint64_t rem = req.remaining_prefill_tokens();
-  if (ts.admitted_tokens + rem > impl_->cfg.per_tenant_admitted_token_limit) {
-    impl_->stats.rejected++;
-    impl_->stats.rejection_by_reason[ErrorCode::capacity_exceeded]++;
-    return Result<void>::err(ErrorCode::capacity_exceeded, "tenant admitted-token limit exceeded");
-  }
+  if (!known_tenant) ts.weight = req.tenant_weight;
 
   auto& s = impl_->requests_[req.request_id];
   s.request = req;
   s.attempt = impl_->alloc_attempt();
   s.lifecycle = Lifecycle::queued;
   s.admit_time = impl_->now();
-  s.plan = impl_->planner->plan(req, s.attempt, Generation(0));
+  s.plan = std::move(plan);
   s.next_chunk_index = 0;
   s.completed_uncached = 0;
   s.completed_token_total = 0;
@@ -241,8 +397,6 @@ Result<void> PrefillScheduler::submit_with_tokens(const PrefillRequest& req,
 
   impl_->stats.submitted++;
   impl_->stats.admitted++;
-  ts.outstanding++;
-  ts.admitted_tokens += rem;
 
   if (rem == 0) {
     // Fully covered by a valid reusable prefix: no prefill execution is needed.
@@ -252,17 +406,29 @@ Result<void> PrefillScheduler::submit_with_tokens(const PrefillRequest& req,
     impl_->stats.completed++;
     s.trace.push_back("fully-cached prompt; no prefill work remains");
     ts.completed_requests++;
-    ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
     impl_->events.record(impl_->now(), "submit", req.request_id, s.attempt, "complete-immediate");
     return Result<void>::ok();
   }
 
+  ts.outstanding++;
+  ts.admitted_tokens += rem;
+  impl_->live_requests++;
   impl_->events.record(impl_->now(), "submit", req.request_id, s.attempt, "queued");
   return Result<void>::ok();
 }
 
 Result<void> PrefillScheduler::submit(const PrefillRequest& req) {
-  std::vector<std::uint32_t> tokens(req.prompt_token_count);
+  // The synthetic payload has one entry per prompt token. The request is
+  // validated before anything of that size is allocated, and a payload that
+  // cannot be allocated is a rejection, not an exception.
+  const auto err = req.validate();
+  if (err.code != ErrorCode::ok) return Result<void>::err(err.code, err.message);
+  std::vector<std::uint32_t> tokens;
+  try {
+    tokens.resize(static_cast<std::size_t>(req.prompt_token_count));
+  } catch (const std::exception&) {
+    return Result<void>::err(ErrorCode::capacity_exceeded, "prompt too large for a synthetic token payload");
+  }
   std::uint64_t seed = 0x9E3779B97F4A7C15ULL ^ req.request_id.value();
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
@@ -284,33 +450,35 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
         s.lifecycle == Lifecycle::rejected)
       continue;
     bool exp = false;
-    if (s.request.deadline && now > *s.request.deadline) exp = true;
-    else if (!s.in_flight && s.request.max_queue_delay &&
-             (now - s.admit_time) > *s.request.max_queue_delay) {
+    bool deadline_passed = false;
+    if (s.request.deadline && now > *s.request.deadline) {
+      exp = true;
+      deadline_passed = true;
+    } else if (!s.in_flight && s.request.max_queue_delay &&
+               (now - s.admit_time) > *s.request.max_queue_delay) {
       impl_->stats.queue_delay_exceeded++;
       exp = true;
     }
     if (exp) {
       s.lifecycle = Lifecycle::expired;
+      s.cancel_pending = false;
       if (s.in_flight) {
-        // Remove from outstanding; a late completion will be rejected.
-        auto git = impl_->groups_.find(s.current_group);
-        if (git != impl_->groups_.end()) {
-          git->second.outstanding.erase(s.request.request_id);
-          if (git->second.outstanding.empty()) {
-            auto wit = impl_->workers_.find(git->second.worker);
-            if (wit != impl_->workers_.end() && wit->second.busy_units > 0) wit->second.busy_units--;
-            impl_->groups_.erase(git);
-          }
-        }
+        // The request no longer runs as far as the scheduler is concerned; a
+        // late completion will be rejected as terminal.
+        s.in_flight = false;
+        impl_->leave_group(s);
       }
       impl_->release_reservation(s);
       impl_->stats.expired++;
-      impl_->stats.deadline_missed++;
-      auto& tsv = impl_->tenants_[s.request.tenant_id];
-      tsv.outstanding = tsv.outstanding > 0 ? tsv.outstanding - 1 : 0;
-      s.trace.push_back("expired; deadline=" + std::to_string(s.request.deadline ? std::int64_t(*s.request.deadline) : 0));
-      impl_->events.record(now, "expire", s.request.request_id, s.attempt, "deadline");
+      impl_->close_request(s);
+      if (deadline_passed) {
+        impl_->stats.deadline_missed++;
+        s.trace.push_back("expired; deadline=" + std::to_string(std::int64_t(*s.request.deadline)));
+        impl_->events.record(now, "expire", s.request.request_id, s.attempt, "deadline");
+      } else {
+        s.trace.push_back("expired; queue delay exceeded");
+        impl_->events.record(now, "expire", s.request.request_id, s.attempt, "queue-delay");
+      }
     }
   }
 
@@ -394,6 +562,10 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
     if (s.lifecycle != Lifecycle::queued || s.in_flight || !impl_->has_pending_chunk(s)) continue;
     const PrefillChunk& ch = s.plan.chunks[s.next_chunk_index];
     const CompatibilityKey k = make_compat_key(s.request, impl_->cfg);
+    // A chunk is positioned within the uncached remainder. The executor is
+    // handed the range of the prompt, which starts after the reused prefix.
+    const std::uint64_t prefix_tokens =
+        s.request.prompt_token_count - s.request.remaining_prefill_tokens();
 
     bool placed = false;
     for (auto& g : open) {
@@ -404,7 +576,7 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
         m.attempt_id = s.attempt;
         m.generation = Generation(0);  // assigned at dispatch
         m.parent_generation = Generation(0);
-        m.token_start = ch.token_start;
+        m.token_start = prefix_tokens + ch.token_start;
         m.token_count = ch.token_count;
         m.work_kind = s.recovered_work ? WorkKind::worker_recovered : ch.work_kind;
         m.memory_estimate_bytes = ch.memory_estimate_bytes;
@@ -420,7 +592,7 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
         g.max_mem = std::max(g.max_mem, ch.memory_estimate_bytes);
         g.tenant_tokens[s.request.tenant_id] += ch.token_count;
         placed = true;
-        s.trace.push_back("packed into group (compatible)");
+        impl_->note(s, "packed into group (compatible)");
         break;
       }
     }
@@ -436,7 +608,7 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
       m.attempt_id = s.attempt;
       m.generation = Generation(0);
       m.parent_generation = Generation(0);
-      m.token_start = ch.token_start;
+      m.token_start = prefix_tokens + ch.token_start;
       m.token_count = ch.token_count;
       m.work_kind = s.recovered_work ? WorkKind::worker_recovered : ch.work_kind;
       m.memory_estimate_bytes = ch.memory_estimate_bytes;
@@ -472,36 +644,50 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
     }
     if (!have) {
       batch.notes.push_back("no compatible worker available; deferred");
-      for (const auto rid : g.rids) impl_->requests_[rid].trace.push_back("deferred: no compatible worker");
+      for (const auto rid : g.rids) impl_->note(impl_->requests_[rid], "deferred: no compatible worker");
       continue;
     }
 
-    // Reserve per-member memory; if any fails, roll back and defer.
-    std::vector<ReservationId> reserved;
-    std::vector<RequestId> reserved_rids;
-    bool ok = true;
-    for (const auto rid : g.rids) {
-      auto& s = impl_->requests_[rid];
-      const std::uint64_t mb = s.plan.chunks[s.next_chunk_index].memory_estimate_bytes;
+    // Reserve per-member memory. A member that does not fit stays queued for a
+    // later cycle and the members that fit are dispatched: rolling the whole
+    // group back would form and fail the same group every cycle whenever the
+    // compatible work together is larger than the budget.
+    std::vector<std::size_t> fits;
+    for (std::size_t i = 0; i < g.rids.size(); ++i) {
+      auto& rs = impl_->requests_[g.rids[i]];
+      const std::uint64_t mb = rs.plan.chunks[rs.next_chunk_index].memory_estimate_bytes;
       const ReservationId rv = impl_->alloc_reservation();
-      auto rres = impl_->mem.reserve(rv, rid, mb, ReservationKind::reserved);
-      if (!rres) { ok = false; break; }
-      reserved.push_back(rv);
-      reserved_rids.push_back(rid);
-      s.reservation = rv;
-      s.reserved_bytes = mb;
-    }
-    if (!ok) {
-      // Roll back reservations of this group.
-      for (const auto& rv : reserved) impl_->mem.release(rv);
-      for (auto& kv : impl_->requests_) {
-        for (const auto rid : reserved_rids) {
-          if (kv.first == rid) { kv.second.reservation = ReservationId(); kv.second.reserved_bytes = 0; }
-        }
+      auto rres = impl_->mem.reserve(rv, g.rids[i], mb, ReservationKind::reserved);
+      if (!rres) {
+        impl_->note(rs, "deferred: memory unavailable");
+        continue;
       }
+      rs.reservation = rv;
+      rs.reserved_bytes = mb;
+      fits.push_back(i);
+    }
+    if (fits.empty()) {
       batch.notes.push_back("memory reservation failed; group deferred");
-      for (const auto rid : g.rids) impl_->requests_[rid].trace.push_back("deferred: memory unavailable");
       continue;
+    }
+    if (fits.size() != g.rids.size()) {
+      batch.notes.push_back("memory reservation partial; group reduced");
+      std::vector<RequestId> kept_rids;
+      std::vector<ExecutableMember> kept_members;
+      g.group.total_token_count = 0;
+      g.group.sum_compute_estimate = 0;
+      g.group.max_memory_estimate_bytes = 0;
+      for (const std::size_t idx : fits) {
+        ExecutableMember km = g.group.members[idx];
+        km.member_index = static_cast<std::uint32_t>(kept_members.size());
+        g.group.total_token_count += km.token_count;
+        g.group.sum_compute_estimate += km.compute_estimate;
+        g.group.max_memory_estimate_bytes = std::max(g.group.max_memory_estimate_bytes, km.memory_estimate_bytes);
+        kept_rids.push_back(g.rids[idx]);
+        kept_members.push_back(km);
+      }
+      g.rids = std::move(kept_rids);
+      g.group.members = std::move(kept_members);
     }
 
     // Commit dispatch: establish generation + authority + in-flight state.
@@ -509,6 +695,15 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
     PrefillScheduler::Impl::Gs gs;
     gs.worker = chosen;
     gs.group = g.group;
+    // Work is accounted to the device of the worker that runs it.
+    const auto& chosen_devices = impl_->workers_[chosen].desc.devices;
+    gs.device = chosen_devices.empty() ? g.group.device : chosen_devices[0].id;
+    gs.dispatch_time = now;
+    {
+      DeviceWork& dw = impl_->stats.per_device[gs.device];
+      dw.groups_run++;
+      dw.peak_reserved_bytes = std::max(dw.peak_reserved_bytes, impl_->mem.reserved_bytes());
+    }
     std::uint64_t group_reserved_bytes = 0;
     for (std::size_t i = 0; i < g.rids.size(); ++i) {
       const RequestId rid = g.rids[i];
@@ -519,12 +714,20 @@ Result<DispatchBatch> PrefillScheduler::run_cycle() {
       s.lifecycle = Lifecycle::dispatched;
       s.current_group = gid;
       s.dispatched_worker = chosen;
+      s.dispatched_device = gs.device;
       s.dispatch_time = now;
-      if (s.first_dispatch_time == 0) {
+      auto& tsv = impl_->tenants_[s.request.tenant_id];
+      if (!s.ever_dispatched) {
+        s.ever_dispatched = true;
         s.first_dispatch_time = now;
         impl_->stats.queue_latency_total_ns += (now - s.admit_time);
         impl_->stats.queue_latency_samples++;
+        tsv.wait_total_ns += (now - s.admit_time);
       }
+      // Tenant service is charged when the work is scheduled, so the fairness
+      // order of the next cycle already sees it.
+      tsv.scheduled_tokens += gs.group.members[i].token_count;
+      tsv.normalized_service += static_cast<double>(gs.group.members[i].token_count);
       gs.group.members[i].generation = gen;
       gs.group.members[i].assigned_worker = chosen;
       gs.outstanding.insert(rid);
@@ -608,26 +811,51 @@ Result<void> PrefillScheduler::report_completion(const MemberResult& result) {
     impl_->events.record(impl_->now(), "stale", result.request_id, result.attempt_id, "no-inflight");
     return Result<void>::err(ErrorCode::duplicate_completion, "no in-flight work for this generation");
   }
-  if (!result.worker.is_nil() && result.worker != s.dispatched_worker) {
+  // The completion has to come from the worker the chunk was dispatched to. A
+  // result that names no worker is only good for work dispatched to the local
+  // in-process worker, whose id is the nil id.
+  if (result.worker != s.dispatched_worker) {
     impl_->stats.stale_authority_rejected++;
     return Result<void>::err(ErrorCode::stale_worker, "completion from a different worker");
   }
+  // An outcome the runtime does not know says nothing about the chunk.
+  if (!is_valid(result.outcome))
+    return Result<void>::err(ErrorCode::invalid_argument, "unknown member outcome");
 
   // ---- Authoritative application ----
-  const PrefillChunk& ch = s.plan.chunks[s.next_chunk_index];
+  const std::uint64_t chunk_tokens = s.plan.chunks[s.next_chunk_index].token_count;
+  const bool chunk_done = result.outcome == MemberOutcome::success ||
+                          result.outcome == MemberOutcome::needs_next_chunk;
   s.in_flight = false;
-  s.chunks_done++;
-  s.completed_uncached += ch.token_count;
-  s.completed_token_total += ch.token_count;
-  impl_->stats.completed_tokens += ch.token_count;
   impl_->stats.execution_latency_total_ns += (impl_->now() - s.dispatch_time);
   impl_->stats.execution_latency_samples++;
+  impl_->release_reservation(s);
+  // Remove the member from its group and free the worker if the group finished.
+  impl_->leave_group(s);
   auto& ts = impl_->tenants_[s.request.tenant_id];
-  ts.scheduled_tokens += ch.token_count;
-  s.normalized_service += static_cast<double>(ch.token_count);
+
+  // Only a chunk that ran to completion counts as completed work.
+  if (chunk_done) {
+    s.chunks_done++;
+    s.completed_uncached += chunk_tokens;
+    s.completed_token_total += chunk_tokens;
+    s.normalized_service += static_cast<double>(chunk_tokens);
+    impl_->stats.completed_tokens += chunk_tokens;
+    impl_->stats.chunk_count++;
+    impl_->stats.per_device[s.dispatched_device].tokens_processed += chunk_tokens;
+  }
 
   if (result.outcome == MemberOutcome::stale_rejected) {
+    // The worker refused the dispatch as stale and did no work. The chunk goes
+    // back in the queue; leaving the request dispatched with nothing in flight
+    // would strand it.
     impl_->stats.stale_authority_rejected++;
+    impl_->requeue_in_flight(s, "worker reported the dispatch stale; chunk re-queued");
+  } else if (s.cancel_pending && result.outcome != MemberOutcome::expired) {
+    // A requested cancellation is authoritative at this boundary whatever the
+    // outcome of the chunk: a failed chunk is not retried for a request that
+    // is being cancelled.
+    impl_->finish_cancelled(s, "cancelled at chunk boundary", "chunk-boundary");
   } else if (result.outcome == MemberOutcome::retryable_failure) {
     if (s.retries_used < s.request.max_retries) {
       s.retries_used++;
@@ -646,77 +874,38 @@ Result<void> PrefillScheduler::report_completion(const MemberResult& result) {
     } else {
       s.lifecycle = Lifecycle::failed_non_retryable;
       impl_->stats.failed_non_retryable++;
-      impl_->stats.completed_tokens += 0;
-      ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-      if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-        ts.admitted_tokens -= s.request.remaining_prefill_tokens();
+      impl_->close_request(s);
       s.trace.push_back("retry budget exhausted; non-retryable failure");
       impl_->events.record(impl_->now(), "fail", s.request.request_id, s.attempt, "non-retryable");
     }
   } else if (result.outcome == MemberOutcome::non_retryable_failure) {
     s.lifecycle = Lifecycle::failed_non_retryable;
     impl_->stats.failed_non_retryable++;
-    ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-    if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-      ts.admitted_tokens -= s.request.remaining_prefill_tokens();
+    impl_->close_request(s);
     s.trace.push_back("non-retryable failure: " + result.message);
     impl_->events.record(impl_->now(), "fail", s.request.request_id, s.attempt, result.message);
   } else if (result.outcome == MemberOutcome::cancelled) {
-    s.lifecycle = Lifecycle::cancelled;
-    s.cancel_pending = false;
-    impl_->stats.cancelled++;
-    ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-    if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-      ts.admitted_tokens -= s.request.remaining_prefill_tokens();
-    s.trace.push_back("cancelled");
-    impl_->events.record(impl_->now(), "cancel", s.request.request_id, s.attempt, "completion");
+    impl_->finish_cancelled(s, "cancelled", "completion");
   } else if (result.outcome == MemberOutcome::expired) {
     s.lifecycle = Lifecycle::expired;
+    s.cancel_pending = false;
     impl_->stats.expired++;
     impl_->stats.deadline_missed++;
-    ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-    if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-      ts.admitted_tokens -= s.request.remaining_prefill_tokens();
+    impl_->close_request(s);
     s.trace.push_back("expired during execution");
   } else {  // success
-    if (s.cancel_pending) {
-      s.lifecycle = Lifecycle::cancelled;
-      s.cancel_pending = false;
-      impl_->stats.cancelled++;
-      ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-      if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-        ts.admitted_tokens -= s.request.remaining_prefill_tokens();
-      s.trace.push_back("cancelled at chunk boundary");
-      impl_->events.record(impl_->now(), "cancel", s.request.request_id, s.attempt, "chunk-boundary");
-    } else if (s.next_chunk_index + 1 < s.plan.chunks.size()) {
+    if (s.next_chunk_index + 1 < s.plan.chunks.size()) {
       s.next_chunk_index++;
       s.lifecycle = Lifecycle::queued;
-      s.trace.push_back("chunk complete; advancing to next chunk");
+      impl_->note(s, "chunk complete; advancing to next chunk");
     } else {
       s.lifecycle = Lifecycle::completed;
       impl_->stats.completed++;
       ts.completed_requests++;
-      ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-      if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-        ts.admitted_tokens -= s.request.remaining_prefill_tokens();
+      impl_->close_request(s);
       s.trace.push_back("prefill completed");
       impl_->events.record(impl_->now(), "complete", s.request.request_id, s.attempt, "ok");
     }
-  }
-
-  impl_->release_reservation(s);
-  // Remove completed member from its group and free the worker if the group finished.
-  if (!s.current_group.is_nil()) {
-    auto git = impl_->groups_.find(s.current_group);
-    if (git != impl_->groups_.end()) {
-      git->second.outstanding.erase(s.request.request_id);
-      if (git->second.outstanding.empty()) {
-        auto wit = impl_->workers_.find(git->second.worker);
-        if (wit != impl_->workers_.end() && wit->second.busy_units > 0) wit->second.busy_units--;
-        impl_->groups_.erase(git);
-      }
-    }
-    s.current_group = GroupId();
   }
 
   impl_->stats.remaining_prefill_tokens = impl_->remaining_tokens_locked();
@@ -737,27 +926,9 @@ CancelResult PrefillScheduler::cancel(RequestId req) {
     impl_->events.record(impl_->now(), "cancel", req, s.attempt, "pending chunk boundary");
     return CancelResult{true, false, ErrorCode::ok, "cancellation pending at chunk boundary"};
   }
-  s.lifecycle = Lifecycle::cancelled;
   impl_->release_reservation(s);
-  impl_->stats.cancelled++;
-  auto& ts = impl_->tenants_[s.request.tenant_id];
-  ts.outstanding = ts.outstanding > 0 ? ts.outstanding - 1 : 0;
-  if (ts.admitted_tokens >= s.request.remaining_prefill_tokens())
-    ts.admitted_tokens -= s.request.remaining_prefill_tokens();
-  if (!s.current_group.is_nil()) {
-    auto git = impl_->groups_.find(s.current_group);
-    if (git != impl_->groups_.end()) {
-      git->second.outstanding.erase(req);
-      if (git->second.outstanding.empty()) {
-        auto wit = impl_->workers_.find(git->second.worker);
-        if (wit != impl_->workers_.end() && wit->second.busy_units > 0) wit->second.busy_units--;
-        impl_->groups_.erase(git);
-      }
-    }
-    s.current_group = GroupId();
-  }
-  s.trace.push_back("cancelled while waiting");
-  impl_->events.record(impl_->now(), "cancel", req, s.attempt, "waiting");
+  impl_->leave_group(s);
+  impl_->finish_cancelled(s, "cancelled while waiting", "waiting");
   return CancelResult{true, false, ErrorCode::ok, "cancelled"};
 }
 
@@ -785,22 +956,19 @@ Result<void> PrefillScheduler::force_retry(RequestId req) {
   auto& s = it->second;
   if (is_terminal_lifecycle(s.lifecycle))
     return Result<void>::err(ErrorCode::illegal_state, "cannot retry a terminal request");
-  if (s.in_flight) {
-    // Release the in-flight reservation and detach from any group.
-    impl_->release_reservation(s);
-    s.in_flight = false;
-    if (!s.current_group.is_nil()) {
-      auto git = impl_->groups_.find(s.current_group);
-      if (git != impl_->groups_.end()) {
-        auto wit = impl_->workers_.find(git->second.worker);
-        if (wit != impl_->workers_.end() && wit->second.busy_units > 0) wit->second.busy_units--;
-        impl_->groups_.erase(git);
-      }
-      s.current_group = GroupId();
-    }
-  }
+  // Nothing is changed unless the retry goes ahead: a refused retry has to
+  // leave the work that is in flight able to complete.
+  if (s.cancel_pending)
+    return Result<void>::err(ErrorCode::illegal_state, "cannot retry a request that is being cancelled");
   if (s.retries_used >= s.request.max_retries)
     return Result<void>::err(ErrorCode::capacity_exceeded, "retry budget exhausted");
+  if (s.in_flight) {
+    // Release the in-flight reservation and take this request out of its
+    // group. The other members of the group are still running on the worker.
+    impl_->release_reservation(s);
+    s.in_flight = false;
+    impl_->leave_group(s);
+  }
   s.retries_used++;
   s.attempt = impl_->alloc_attempt();
   s.plan = impl_->planner->plan(s.request, s.attempt, Generation(0));
@@ -821,17 +989,20 @@ Result<void> PrefillScheduler::register_worker(const WorkerDescriptor& w) {
   auto lk = impl_->lock();
   if (w.worker_id.is_nil())
     return Result<void>::err(ErrorCode::invalid_argument, "worker id is nil");
+  const auto known = impl_->workers_.find(w.worker_id);
+  // A registration under the boot id the worker already has is the same
+  // process, and what it was given stays valid. Any other registration is a
+  // restart: the previous process can no longer complete its work, which is
+  // put back in the queue instead of staying in flight forever.
+  const bool same_boot = known != impl_->workers_.end() && !w.boot_id.is_nil() &&
+                         known->second.desc.boot_id == w.boot_id;
+  if (known != impl_->workers_.end() && !same_boot)
+    impl_->recover_worker_groups(w.worker_id, "recovered after worker restart");
   auto& ws = impl_->workers_[w.worker_id];
-  if (ws.desc.boot_id.is_nil() && !w.boot_id.is_nil()) {
-    ws.desc = w;
-  } else if (!w.boot_id.is_nil()) {
-    ws.desc = w;
-  } else {
-    WorkerDescriptor d = w;
-    d.boot_id = WorkerBootId(impl_->next_boot_value++);
-    ws.desc = d;
-  }
-  ws.busy_units = 0;
+  WorkerDescriptor d = w;
+  if (d.boot_id.is_nil()) d.boot_id = WorkerBootId(impl_->next_boot_value++);
+  ws.desc = d;
+  if (!same_boot) ws.busy_units = 0;
   if (ws.desc.state == WorkerState::unknown) ws.desc.state = WorkerState::ready;
   ws.local_exec.reset();
   impl_->events.record(impl_->now(), "worker-register", RequestId(), AttemptId(),
@@ -851,26 +1022,8 @@ Result<void> PrefillScheduler::unregister_worker(WorkerId w) {
 
 Result<void> PrefillScheduler::worker_lost(WorkerId w) {
   auto lk = impl_->lock();
-  for (auto git = impl_->groups_.begin(); git != impl_->groups_.end();) {
-    if (git->second.worker != w) { ++git; continue; }
-    for (const RequestId rid : git->second.outstanding) {
-      auto it = impl_->requests_.find(rid);
-      if (it != impl_->requests_.end()) {
-        auto& s = it->second;
-        if (s.in_flight && s.lifecycle == Lifecycle::dispatched) {
-          s.in_flight = false;
-          s.recovered_work = true;
-          impl_->release_reservation(s);
-          s.current_generation = Generation(0);
-          s.lifecycle = Lifecycle::queued;
-          // Keep the same attempt and same next_chunk_index: redo the in-flight chunk.
-          s.trace.push_back("recovered after worker loss");
-          impl_->events.record(impl_->now(), "worker-lost", rid, s.attempt, "recovered");
-        }
-      }
-    }
-    impl_->groups_.erase(git++);
-  }
+  // Keep the same attempt and same next_chunk_index: redo the in-flight chunk.
+  impl_->recover_worker_groups(w, "recovered after worker loss");
   auto wit = impl_->workers_.find(w);
   if (wit != impl_->workers_.end()) {
     wit->second.busy_units = 0;
@@ -884,6 +1037,19 @@ Result<void> PrefillScheduler::worker_lost(WorkerId w) {
 Result<void> PrefillScheduler::roll_epoch() {
   auto lk = impl_->lock();
   impl_->epoch = Epoch(impl_->epoch.value() + 1);
+  // A completion of work dispatched under the previous epoch is stale from
+  // now on. That work is put back in the queue; left in flight it would hold
+  // its memory and its worker's capacity forever.
+  for (auto& kv : impl_->groups_) {
+    for (const RequestId rid : kv.second.outstanding) {
+      auto it = impl_->requests_.find(rid);
+      if (it == impl_->requests_.end() || !it->second.in_flight) continue;
+      it->second.current_group = GroupId();
+      impl_->requeue_in_flight(it->second, "recovered after epoch roll");
+    }
+  }
+  impl_->groups_.clear();
+  for (auto& wk : impl_->workers_) wk.second.busy_units = 0;
   impl_->events.record(impl_->now(), "epoch-roll", RequestId(), AttemptId(),
                        "epoch=" + std::to_string(impl_->epoch.value()));
   return Result<void>::ok();
@@ -1003,7 +1169,7 @@ Result<void> PrefillScheduler::drive_until_quiescent(std::size_t max_cycles) {
 
 Stats PrefillScheduler::stats() const {
   auto lk = impl_->lock();
-  return impl_->stats;
+  return impl_->stats_locked();
 }
 
 std::uint64_t PrefillScheduler::memory_reserved() const { return impl_->mem.reserved_bytes(); }
@@ -1012,7 +1178,7 @@ std::uint64_t PrefillScheduler::memory_available() const { return impl_->mem.ava
 Snapshot PrefillScheduler::snapshot() const {
   auto lk = impl_->lock();
   Snapshot sn;
-  sn.stats = impl_->stats;
+  sn.stats = impl_->stats_locked();
   sn.queue_depth = impl_->queued_count_locked();
   sn.waiting_tokens = impl_->waiting_tokens_locked();
   sn.remaining_prefill_tokens = impl_->remaining_tokens_locked();
@@ -1125,6 +1291,13 @@ PersistedState PrefillScheduler::export_state() const {
     r.has_deadline = s.request.deadline.has_value();
     r.has_queue_delay = s.request.max_queue_delay.has_value();
     r.max_queue_delay_ns = s.request.max_queue_delay ? std::int64_t(*s.request.max_queue_delay) : 0;
+    r.backend = s.request.backend;
+    r.device = s.request.device;
+    r.input_layout = s.request.input_layout;
+    r.memory_estimate_bytes = s.request.memory_estimate_bytes;
+    r.compute_estimate = s.request.compute_estimate;
+    r.max_retries = s.request.max_retries;
+    r.retries_used = s.retries_used;
     st.requests.push_back(std::move(r));
   }
   for (const auto& kv : impl_->workers_) {
@@ -1167,12 +1340,62 @@ Result<void> PrefillScheduler::recover(const std::string& path) {
 
 Result<void> PrefillScheduler::import_state(const PersistedState& st) {
   auto lk = impl_->lock();
+
+  // ---- Validate the whole snapshot before any live state is replaced ----
+  auto corrupt = [](const char* message) {
+    return Result<void>::err(ErrorCode::corrupt_state, message);
+  };
+  if (st.epoch.is_nil()) return corrupt("persisted epoch is nil");
+  std::set<RequestId, std::less<RequestId>> seen;
+  std::uint64_t max_attempt = 0;
+  std::uint64_t max_generation = 0;
+  for (const auto& rec : st.requests) {
+    if (rec.request_id.is_nil() || rec.tenant_id.is_nil())
+      return corrupt("request record without an identity");
+    if (rec.prompt_token_count == 0 || rec.cached_tokens > rec.prompt_token_count)
+      return corrupt("request record with an impossible token extent");
+    if (!is_valid(rec.lifecycle) || !is_valid(rec.work_kind) || !is_valid(rec.relation) ||
+        !is_valid(rec.numeric_mode) || !is_valid(rec.latency_class) || !is_valid(rec.input_layout))
+      return corrupt("request record with an enumeration out of range");
+    if (rec.max_retries < 0 || rec.retries_used < 0)
+      return corrupt("request record with a negative retry count");
+    if (!std::isfinite(rec.tenant_weight) || rec.tenant_weight <= 0.0 ||
+        !std::isfinite(rec.normalized_service) || rec.normalized_service < 0.0)
+      return corrupt("request record with an invalid weight or service value");
+    if (!is_terminal_lifecycle(rec.lifecycle) &&
+        rec.next_chunk_token_start >= rec.prompt_token_count - rec.cached_tokens)
+      return corrupt("unfinished request record with no remaining work");
+    if (!seen.insert(rec.request_id).second) return corrupt("duplicate request id in snapshot");
+    max_attempt = std::max(max_attempt, rec.attempt_id.value());
+    max_generation = std::max(max_generation, rec.current_generation.value());
+  }
+  for (const auto& rec : st.workers) {
+    if (!is_valid(rec.state)) return corrupt("worker record with a state out of range");
+  }
+  for (const auto& rec : st.tenants) {
+    if (rec.tenant_id.is_nil()) return corrupt("tenant record without an identity");
+    if (!std::isfinite(rec.weight) || rec.weight <= 0.0 ||
+        !std::isfinite(rec.normalized_service) || rec.normalized_service < 0.0)
+      return corrupt("tenant record with an invalid weight or service value");
+  }
+
+  // ---- Replace the live state ----
+  // Nothing in the snapshot is in flight, so the reservations and the worker
+  // capacity held by live in-flight work are given back first.
+  for (auto& kv : impl_->requests_) impl_->release_reservation(kv.second);
+  for (auto& wk : impl_->workers_) wk.second.busy_units = 0;
+
   impl_->epoch = st.epoch;
-  if (st.next_generation_value > impl_->next_generation_value) impl_->next_generation_value = st.next_generation_value;
-  if (st.next_attempt_value > impl_->next_attempt_value) impl_->next_attempt_value = st.next_attempt_value;
+  // An identifier handed out after recovery must not repeat one a recovered
+  // request already carries, whatever the persisted counters say.
+  impl_->next_generation_value = std::max({impl_->next_generation_value, st.next_generation_value,
+                                           max_generation + 1});
+  impl_->next_attempt_value = std::max({impl_->next_attempt_value, st.next_attempt_value,
+                                        max_attempt + 1});
   impl_->requests_.clear();
   impl_->groups_.clear();
   impl_->tenants_.clear();
+  impl_->live_requests = 0;
 
   for (const auto& rec : st.requests) {
     PrefillRequest r;
@@ -1183,6 +1406,7 @@ Result<void> PrefillScheduler::import_state(const PersistedState& st) {
     r.adapter_relation = rec.relation;
     r.prompt_token_count = rec.prompt_token_count;
     r.reusable_prefix.token_count = rec.cached_tokens;
+    r.reusable_prefix.validated = rec.cached_tokens > 0;
     r.vocab = rec.vocab;
     r.numeric_mode = rec.numeric_mode;
     r.latency_class = rec.latency_class;
@@ -1191,6 +1415,15 @@ Result<void> PrefillScheduler::import_state(const PersistedState& st) {
     r.arrival_time = rec.arrival_ns;
     if (rec.has_deadline) r.deadline = Nanoseconds(rec.deadline_ns);
     if (rec.has_queue_delay) r.max_queue_delay = Nanoseconds(rec.max_queue_delay_ns);
+    // The estimates shape the chunk plan and the reservations, the backend,
+    // device and layout decide where the work may run, and the retry counts
+    // bound it. Without them a recovered request is not the admitted one.
+    r.backend = rec.backend;
+    r.device = rec.device;
+    r.input_layout = rec.input_layout;
+    r.memory_estimate_bytes = rec.memory_estimate_bytes;
+    r.compute_estimate = rec.compute_estimate;
+    r.max_retries = rec.max_retries;
 
     auto& s = impl_->requests_[rec.request_id];
     s.request = r;
@@ -1202,39 +1435,50 @@ Result<void> PrefillScheduler::import_state(const PersistedState& st) {
     s.normalized_service = rec.normalized_service;
     s.admit_time = rec.arrival_ns;
     s.last_work_kind = rec.work_kind;
-    s.retries_used = 0;
+    s.retries_used = rec.retries_used;
     s.recovered_work = false;
     s.completed_uncached = 0;
     s.trace.clear();
     s.trace.push_back("recovered from persistence");
 
-    if (rec.next_chunk_token_start >= r.remaining_prefill_tokens()) {
+    const std::uint64_t rem = r.remaining_prefill_tokens();
+    if (rec.next_chunk_token_start >= rem) {
       s.next_chunk_index = static_cast<std::uint32_t>(s.plan.chunks.size());
-      s.completed_uncached = r.remaining_prefill_tokens();
+      s.completed_uncached = rem;
     } else {
       s.next_chunk_index = impl_->index_for_token_start(s.plan, rec.next_chunk_token_start);
+      // The chunks before the next one were completed and stay completed.
+      s.completed_uncached = s.plan.chunks[s.next_chunk_index].token_start;
     }
 
-    // Conservative reconciliation of work that was in-flight at process death.
-    if (s.lifecycle == Lifecycle::dispatched || s.lifecycle == Lifecycle::running) {
+    // Conservative reconciliation: every request that had not reached a
+    // terminal state is queued again. Work that was in flight at process
+    // death redoes its chunk under a new generation.
+    if (!is_terminal_lifecycle(s.lifecycle) && s.lifecycle != Lifecycle::queued) {
+      const bool was_in_flight = s.lifecycle == Lifecycle::dispatched ||
+                                 s.lifecycle == Lifecycle::running;
       s.lifecycle = Lifecycle::queued;
       s.in_flight = false;
       s.current_generation = Generation(0);
-      s.recovered_work = true;
-      s.trace.push_back("reconciled in-flight-at-death work conservatively (redo chunk)");
+      s.recovered_work = was_in_flight;
+      s.trace.push_back(was_in_flight
+                            ? "reconciled in-flight-at-death work conservatively (redo chunk)"
+                            : "re-queued unfinished work on recovery");
     }
 
     auto& ts = impl_->tenants_[r.tenant_id];
-    if (ts.weight <= 0.0) ts.weight = r.tenant_weight;
-    if (s.lifecycle != Lifecycle::completed && s.lifecycle != Lifecycle::cancelled &&
-        s.lifecycle != Lifecycle::expired && s.lifecycle != Lifecycle::failed_non_retryable &&
-        s.lifecycle != Lifecycle::rejected) {
+    ts.weight = r.tenant_weight;
+    if (!is_terminal_lifecycle(s.lifecycle)) {
       ts.outstanding++;
-      ts.admitted_tokens += r.remaining_prefill_tokens();
+      ts.admitted_tokens += rem;
+      impl_->live_requests++;
     }
   }
 
   for (const auto& rec : st.workers) {
+    // The local in-process worker belongs to this process. What an earlier
+    // process recorded for it must not detach the executor attached here.
+    if (rec.worker_id.is_nil()) continue;
     auto& ws = impl_->workers_[rec.worker_id];
     ws.desc.worker_id = rec.worker_id;
     ws.desc.boot_id = rec.boot_id;
@@ -1247,14 +1491,14 @@ Result<void> PrefillScheduler::import_state(const PersistedState& st) {
     ws.local_exec.reset();
   }
   for (const auto& rec : st.tenants) {
-    TenantService t;
+    // Outstanding work and admitted tokens were recomputed from the request
+    // records above; the tenant record supplies the service history only.
+    auto& t = impl_->tenants_[rec.tenant_id];
     t.weight = rec.weight;
     t.scheduled_tokens = rec.scheduled_tokens;
     t.completed_requests = rec.completed_requests;
     t.wait_total_ns = rec.wait_total_ns;
-    t.outstanding = rec.outstanding;
     t.normalized_service = rec.normalized_service;
-    impl_->tenants_[rec.tenant_id] = t;
   }
   impl_->stats.remaining_prefill_tokens = impl_->remaining_tokens_locked();
   impl_->events.record(impl_->now(), "recover", RequestId(), AttemptId(),

@@ -42,9 +42,17 @@ void write_req(ByteWriter& w, const PersistedRequestRecord& r) {
   w.u8(r.has_deadline ? 1u : 0u);
   w.u8(r.has_queue_delay ? 1u : 0u);
   w.i64(r.max_queue_delay_ns);
+  // Format version 2.
+  w.str(r.backend);
+  w.strong(r.device);
+  w.u8(static_cast<std::uint8_t>(r.input_layout));
+  w.u64(r.memory_estimate_bytes);
+  w.u64(r.compute_estimate);
+  w.u32(static_cast<std::uint32_t>(r.max_retries));
+  w.u32(static_cast<std::uint32_t>(r.retries_used));
 }
 
-Result<PersistedRequestRecord> read_req(ByteReader& r) {
+Result<PersistedRequestRecord> read_req(ByteReader& r, std::uint32_t version) {
   PersistedRequestRecord rec;
   auto rd = [&]() -> Result<void> {
     auto ridv = r.strong<RequestIdTag>(); if (!ridv) return Result<void>::err(ridv.error()); rec.request_id = ridv.value();
@@ -77,6 +85,15 @@ Result<PersistedRequestRecord> read_req(ByteReader& r) {
     u8 = r.u8(); if (!u8) return Result<void>::err(u8.error()); rec.has_deadline = u8.value() != 0;
     u8 = r.u8(); if (!u8) return Result<void>::err(u8.error()); rec.has_queue_delay = u8.value() != 0;
     i = r.i64(); if (!i) return Result<void>::err(i.error()); rec.max_queue_delay_ns = i.value();
+    if (version >= 2) {
+      s = r.str(); if (!s) return Result<void>::err(s.error()); rec.backend = s.value();
+      auto dv = r.strong<DeviceIdTag>(); if (!dv) return Result<void>::err(dv.error()); rec.device = dv.value();
+      u8 = r.u8(); if (!u8) return Result<void>::err(u8.error()); rec.input_layout = static_cast<InputLayout>(u8.value());
+      u64 = r.u64(); if (!u64) return Result<void>::err(u64.error()); rec.memory_estimate_bytes = u64.value();
+      u64 = r.u64(); if (!u64) return Result<void>::err(u64.error()); rec.compute_estimate = u64.value();
+      u32 = r.u32(); if (!u32) return Result<void>::err(u32.error()); rec.max_retries = static_cast<int>(u32.value());
+      u32 = r.u32(); if (!u32) return Result<void>::err(u32.error()); rec.retries_used = static_cast<int>(u32.value());
+    }
     return Result<void>::ok();
   };
   auto res = rd();
@@ -149,7 +166,9 @@ Result<std::vector<std::uint8_t>> serialize_state(const PersistedState& state) {
 
   ByteWriter w;
   w.u32(state.magic);
-  w.u32(state.version);
+  // The records above are written in the current layout, so the header names
+  // the current version whatever version the state was read from.
+  w.u32(kPersistenceVersion);
   w.u32(0u);  // flags (reserved)
   w.u64(static_cast<std::uint64_t>(pl.size()));
   w.u64(checksum);
@@ -167,11 +186,13 @@ Result<PersistedState> deserialize_state(const std::vector<std::uint8_t>& blob) 
 
   if (magic.value() != kPersistenceMagic)
     return Result<PersistedState>::err(ErrorCode::corrupt_state, "bad magic");
-  if (version.value() != kPersistenceVersion)
+  if (version.value() < kPersistenceVersionMin || version.value() > kPersistenceVersion)
     return Result<PersistedState>::err(ErrorCode::unknown_version, "unsupported persistence version");
   const std::size_t blob_len = blob.size();
   if (std::size_t(plen.value()) > blob_len - r.offset())
     return Result<PersistedState>::err(ErrorCode::truncation, "payload length exceeds blob");
+  if (std::size_t(plen.value()) != blob_len - r.offset())
+    return Result<PersistedState>::err(ErrorCode::corrupt_state, "trailing bytes after payload");
 
   std::uint64_t checksum = 1469598103934665603ULL;
   checksum = fnv1a64(checksum, blob.data() + r.offset(), static_cast<std::size_t>(plen.value()));
@@ -191,7 +212,7 @@ Result<PersistedState> deserialize_state(const std::vector<std::uint8_t>& blob) 
   auto nreq = pr.u64(); if (!nreq) return Result<PersistedState>::err(nreq.error());
   if (nreq.value() > (1ULL << 24)) return Result<PersistedState>::err(ErrorCode::corrupt_state, "unreasonable request count");
   for (std::uint64_t i = 0; i < nreq.value(); ++i) {
-    auto rec = read_req(pr); if (!rec) return Result<PersistedState>::err(rec.error());
+    auto rec = read_req(pr, version.value()); if (!rec) return Result<PersistedState>::err(rec.error());
     s.requests.push_back(std::move(rec.value()));
   }
   auto nwk = pr.u64(); if (!nwk) return Result<PersistedState>::err(nwk.error());
@@ -209,13 +230,21 @@ Result<PersistedState> deserialize_state(const std::vector<std::uint8_t>& blob) 
   if (pr.remaining() != 0)
     return Result<PersistedState>::err(ErrorCode::corrupt_state, "trailing bytes in payload");
 
-  // Semantic validation: lifecycle and work_kind must be in range.
+  // Semantic validation: every enumeration must be in range.
   for (const auto& rec : s.requests) {
-    if (static_cast<int>(rec.lifecycle) < static_cast<int>(Lifecycle::submitted) ||
-        static_cast<int>(rec.lifecycle) > static_cast<int>(Lifecycle::rejected))
+    if (!is_valid(rec.lifecycle))
       return Result<PersistedState>::err(ErrorCode::corrupt_state, "bad lifecycle in record");
+    if (!is_valid(rec.work_kind) || !is_valid(rec.relation) || !is_valid(rec.numeric_mode) ||
+        !is_valid(rec.latency_class) || !is_valid(rec.input_layout))
+      return Result<PersistedState>::err(ErrorCode::corrupt_state, "enumeration out of range in record");
+    if (rec.max_retries < 0 || rec.retries_used < 0)
+      return Result<PersistedState>::err(ErrorCode::corrupt_state, "negative retry count in record");
     if (rec.cached_tokens > rec.prompt_token_count)
       return Result<PersistedState>::err(ErrorCode::corrupt_state, "cached_tokens exceeds prompt length");
+  }
+  for (const auto& rec : s.workers) {
+    if (!is_valid(rec.state))
+      return Result<PersistedState>::err(ErrorCode::corrupt_state, "bad worker state in record");
   }
   return Result<PersistedState>::ok(std::move(s));
 }

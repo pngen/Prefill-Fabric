@@ -26,8 +26,8 @@ groups via the attached executor **outside** the lock, then calls `report_comple
 `run_cycle()` performs: (1) a deadline and max-queue-delay expiry sweep; (2) candidate selection using
 a lexicographic multi-criteria ordering (deadline urgency, deadline, priority, latency class, weighted
 normalized-service fairness deficit, starvation aging, arrival, identifier) rather than a single
-score; (3) compatibility-aware formation into `ExecutionGroup`s; (4) per-member memory reservation
-with rollback on failure; (5) deterministic worker assignment. It never blocks on I/O under the lock.
+score; (3) compatibility-aware formation into `ExecutionGroup`s; (4) per-member memory reservation,
+leaving a member that does not fit queued for a later cycle; (5) deterministic worker assignment. It never blocks on I/O under the lock.
 
 `report_completion()` validates authority in order: epoch, current worker boot id, attempt, chunk/work
 generation, terminal/duplicate state, then applies per-member terminal-or-continuation outcomes.

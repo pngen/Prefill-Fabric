@@ -1,6 +1,7 @@
 // Prefill Fabric - prefill request, reusable-prefix metadata, plan, chunk.
 // Copyright (c) 2026 Summon Software Labs. Apache-2.0.
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -105,8 +106,15 @@ struct PrefillRequest {
       return ErrorInfo(ErrorCode::invalid_reusable_prefix, "reusable prefix exceeds prompt length");
     if (reusable_prefix.validated && reusable_prefix.token_count == 0)
       return ErrorInfo(ErrorCode::invalid_reusable_prefix, "validated reusable prefix has zero tokens");
-    if (tenant_weight <= 0.0)
+    // Prefix tokens are left out of the prefill work, so a prefix that is not
+    // claimed to be valid must not be taken on trust.
+    if (reusable_prefix.token_count > 0 && !reusable_prefix.validated)
+      return ErrorInfo(ErrorCode::invalid_reusable_prefix, "reusable prefix is not validated");
+    if (!(tenant_weight > 0.0) || !std::isfinite(tenant_weight))
       return ErrorInfo(ErrorCode::invalid_argument, "tenant_weight must be > 0");
+    if (!is_valid(adapter_relation) || !is_valid(input_layout) || !is_valid(numeric_mode) ||
+        !is_valid(latency_class))
+      return ErrorInfo(ErrorCode::invalid_argument, "enumeration value out of range");
     if (max_retries < 0) return ErrorInfo(ErrorCode::invalid_argument, "max_retries must be >= 0");
     if (deadline && *deadline < arrival_time)
       return ErrorInfo(ErrorCode::deadline_impossible, "deadline before arrival");

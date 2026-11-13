@@ -6,8 +6,10 @@
 #include <memory>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <mutex>
+#include <vector>
 #include "prefillfabric/scheduler.hpp"
 #include "prefillfabric/network.hpp"
 #include "prefillfabric/protocol.hpp"
@@ -49,6 +51,11 @@ class Coordinator {
   std::map<WorkerId, std::shared_ptr<Socket>, std::less<WorkerId>> worker_socks_;
   std::map<WorkerId, WorkerDescriptor, std::less<WorkerId>> workers_;
   std::map<RequestId, std::vector<std::uint32_t>, std::less<RequestId>> tokens_;
+  // Connection handlers run detached and use this object. shutdown() unblocks
+  // them and waits for the last one, so none outlives the coordinator.
+  std::vector<std::shared_ptr<Socket>> open_socks_;
+  std::size_t active_handlers_ = 0;
+  std::condition_variable handlers_cv_;
 };
 
 }  // namespace prefillfabric

@@ -1,0 +1,6 @@
+add_executable(invariants_test invariants_test.cpp)
+target_link_libraries(invariants_test PRIVATE pf_test_common)
+if(MSVC)
+  target_compile_options(invariants_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME invariants COMMAND invariants_test)

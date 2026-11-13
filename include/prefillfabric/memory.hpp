@@ -54,7 +54,10 @@ class MemoryGovernor {
       : max_bytes_(max_bytes), headroom_(headroom_bytes), reserved_(0) {}
 
   // Total hardware-backed memory this governor manages.
-  std::uint64_t capacity() const noexcept { return max_bytes_; }
+  std::uint64_t capacity() const noexcept {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return max_bytes_;
+  }
   void set_capacity(std::uint64_t bytes) noexcept {
     std::lock_guard<std::mutex> lk(mtx_);
     std::uint64_t newmax = bytes;
@@ -138,8 +141,9 @@ class MemoryGovernor {
         reserved_ -= it->second.bytes;
       }
     }
-    it->second.active = false;
-    it->second.bytes = 0;
+    // A released reservation is forgotten. Keeping an inactive record for
+    // every reservation ever made would grow without bound.
+    records_.erase(it);
     return Result<void>::ok();
   }
 

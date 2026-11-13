@@ -1,6 +1,7 @@
 // Prefill Fabric - coordinator implementation.
 // Copyright (c) 2026 Summon Software Labs. Apache-2.0.
 #include "prefillfabric/coordinator.hpp"
+#include <algorithm>
 #include <thread>
 #include <chrono>
 
@@ -33,6 +34,21 @@ void Coordinator::shutdown() {
   listener_.close();
   if (accept_thread_.joinable()) accept_thread_.join();
   if (schedule_thread_.joinable()) schedule_thread_.join();
+  // No new connection is accepted any more. The handlers of the open ones are
+  // blocked on their sockets and use this object, so each socket is shut down
+  // and the last handler is waited for before the caller may destroy it.
+  std::unique_lock<std::mutex> lk(conn_mtx_);
+  for (const auto& s : open_socks_) {
+#ifdef _WIN32
+    // Shutting the socket down fails every later receive; a receive that is
+    // already blocked is not woken by it and has to be cancelled.
+    ::shutdown(s->native(), SD_BOTH);
+    ::CancelIoEx(reinterpret_cast<HANDLE>(s->native()), nullptr);
+#else
+    ::shutdown(s->native(), SHUT_RDWR);
+#endif
+  }
+  handlers_cv_.wait(lk, [this] { return active_handlers_ == 0; });
 }
 
 void Coordinator::accept_loop() {
@@ -40,7 +56,18 @@ void Coordinator::accept_loop() {
     auto s = listener_.accept();
     if (!s) { if (stop_.load()) break; std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
     auto sp = std::make_shared<Socket>(std::move(s.value()));
-    std::thread(&Coordinator::handle_connection, this, sp).detach();
+    {
+      std::lock_guard<std::mutex> lk(conn_mtx_);
+      open_socks_.push_back(sp);
+      ++active_handlers_;
+    }
+    std::thread([this, sp] {
+      handle_connection(sp);
+      std::lock_guard<std::mutex> lk(conn_mtx_);
+      open_socks_.erase(std::remove(open_socks_.begin(), open_socks_.end(), sp), open_socks_.end());
+      --active_handlers_;
+      handlers_cv_.notify_all();
+    }).detach();
   }
 }
 
@@ -77,19 +104,25 @@ void Coordinator::handle_connection(std::shared_ptr<Socket> sock) {
       if (!rb) {
         std::lock_guard<std::mutex> lk(conn_mtx_);
         auto it = worker_socks_.find(wd.worker_id);
-        if (it != worker_socks_.end() && it->second == sock) worker_socks_.erase(it);
-        scheduler_->worker_lost(wd.worker_id);
+        // Only the connection that currently stands for the worker reports it
+        // lost. One that a re-registration replaced is stale, and its end
+        // must not take the restarted worker down with it.
+        if (it != worker_socks_.end() && it->second == sock) {
+          worker_socks_.erase(it);
+          scheduler_->worker_lost(wd.worker_id);
+        }
         return;
       }
       auto msg = decode_frame(rb.value());
       if (!msg) continue;
       if (msg.value().kind == MsgKind::completion) {
+        // Every member result is applied on its own: a refused one is
+        // answered with an error and does not drop the results after it.
         for (const auto& mr : msg.value().member_results) {
           auto res = scheduler_->report_completion(mr);
           if (!res) {
             Message e; e.kind = MsgKind::error; e.error = res.error(); e.request_id = mr.request_id;
             auto eb = encode_frame(e); if (eb) sock->send_frame(eb.value().data(), eb.value().size());
-            break;
           }
         }
       } else if (msg.value().kind == MsgKind::ping) {
@@ -110,9 +143,17 @@ void Coordinator::handle_connection(std::shared_ptr<Socket> sock) {
       const Message& m = msg.value();
       switch (m.kind) {
         case MsgKind::submit: {
-          std::vector<std::uint32_t> toks = m.tokens;
-          { std::lock_guard<std::mutex> lk(conn_mtx_); tokens_[m.request.request_id] = std::move(toks); }
-          auto res = scheduler_->submit(m.request);
+          // The payload is checked against the request and kept only when the
+          // request is admitted: a refused submit, such as one that reuses the
+          // id of a live request, must not replace that request's tokens. The
+          // dispatcher looks tokens up under the same lock, so it never sees
+          // an admitted request without them.
+          Result<void> res = Result<void>::ok();
+          {
+            std::lock_guard<std::mutex> lk(conn_mtx_);
+            res = scheduler_->submit_with_tokens(m.request, m.tokens);
+            if (res) tokens_[m.request.request_id] = m.tokens;
+          }
           Message a; a.kind = MsgKind::submit_ack; a.request_id = m.request.request_id;
           if (res) a.accepted = true; else a.error = res.error();
           auto ab = encode_frame(a); if (ab) sock->send_frame(ab.value().data(), ab.value().size());
@@ -145,7 +186,6 @@ void Coordinator::handle_connection(std::shared_ptr<Socket> sock) {
             if (!res) {
               Message e; e.kind = MsgKind::error; e.error = res.error(); e.request_id = mr.request_id;
               auto eb = encode_frame(e); if (eb) sock->send_frame(eb.value().data(), eb.value().size());
-              break;
             }
           }
           break;

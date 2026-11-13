@@ -58,8 +58,15 @@ struct SchedulerConfig {
   // Effective usable memory budget after headroom.
   std::uint64_t usable_memory_bytes() const noexcept {
     std::uint64_t headroom = memory_headroom_bytes;
-    const std::uint64_t frac = static_cast<std::uint64_t>(
-        static_cast<double>(device_memory_bytes) * memory_headroom_fraction);
+    // A fraction outside (0, 1) is clamped rather than converted as it is:
+    // converting a negative or non-finite product to an integer is undefined.
+    std::uint64_t frac = 0;
+    if (memory_headroom_fraction >= 1.0) {
+      frac = device_memory_bytes;
+    } else if (memory_headroom_fraction > 0.0) {
+      frac = static_cast<std::uint64_t>(
+          static_cast<double>(device_memory_bytes) * memory_headroom_fraction);
+    }
     if (frac > headroom) headroom = frac;
     return device_memory_bytes > headroom ? device_memory_bytes - headroom : 0;
   }
